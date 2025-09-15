@@ -1,0 +1,4 @@
+# OpenPilot UI Streaming Server Dependencies
+Flask==2.3.3
+flask-sock==0.7.0
+numpy==1.24.3
