@@ -27,7 +27,7 @@ static void writeDebug(const QString& message) {
         debugStream.setDevice(&debugFile);
     }
     QString timestamp = QDateTime::currentDateTime().toString("hh:mm:ss.zzz");
-    debugStream << "[" << timestamp << "] " << message << Qt::endl;
+    debugStream << "[" << timestamp << "] " << message << endl;
     debugStream.flush();
     
     // Also write to qDebug for standard logging
