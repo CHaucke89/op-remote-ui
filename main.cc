@@ -2,15 +2,13 @@
 
 #include <QApplication>
 #include <QTranslator>
-#include <QTimer>
-#include <QPixmap>
-#include <QDateTime>
 
 #include "system/hardware/hw.h"
 #include "selfdrive/ui/qt/qt_window.h"
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/window.h"
 #include "selfdrive/ui/touch_injector.h"
+#include "selfdrive/ui/frame_streamer.h"
 
 int main(int argc, char *argv[]) {
   setpriority(PRIO_PROCESS, 0, -20);
@@ -31,23 +29,14 @@ int main(int argc, char *argv[]) {
   setMainWindow(&w);
   a.installEventFilter(&w);
 
-  // Set up screenshot timer (your existing code)
-  QTimer screenshot_timer;
-  QObject::connect(&screenshot_timer, &QTimer::timeout, [&w]() {
-    QPixmap pixmap = w.grab();  // Capture the current window
-    QString filename = QString("/tmp/ui_frame_%1.png").arg(QDateTime::currentSecsSinceEpoch());
-    if (!pixmap.save(filename)) {
-      qWarning() << "Failed to save screenshot to" << filename;
-    } else {
-      qDebug() << "Screenshot saved to" << filename;
-    }
-  });
-  screenshot_timer.start(2000);  // 2 seconds for better responsiveness
-  
+  // Set up memory-based frame streamer (no disk storage)
+  FrameStreamer frameStreamer(&w);
+  frameStreamer.start();
+
   // Set up touch injector
   TouchInjector touchInjector(&w);
-  
-  qDebug() << "UI started with touch injection support";
-  
+
+  qDebug() << "UI started with memory-only streaming (no disk storage)";
+
   return a.exec();
 }

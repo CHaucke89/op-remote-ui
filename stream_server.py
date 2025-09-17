@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OpenPilot UI Streaming Server - Memory-Only Architecture
-No disk storage required - uses shared memory and WebSocket streaming
+OpenPilot UI Streaming Server - Fixed Real-Time Version
+Real-time WebSocket streaming with proper frame broadcasting
 """
 
 import os
@@ -9,17 +9,16 @@ import time
 import json
 import socket
 import struct
-import asyncio
 import mmap
 import subprocess
 import threading
-from typing import Optional, Set
-from collections import deque
 import base64
+import queue
+from typing import Set
+from collections import deque
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, Response
 from flask_sock import Sock
-import numpy as np
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -28,28 +27,38 @@ sock = Sock(app)
 SHM_NAME = "/openpilot_ui_frames"
 SHM_SIZE = 4 * 1920 * 1080 + 1024  # Frame buffer + metadata
 
+# Global queue for frame distribution
+frame_queue = queue.Queue(maxsize=10)
+websocket_clients = set()
+clients_lock = threading.Lock()
+
 # Frame cache for efficient streaming
 class FrameCache:
     def __init__(self, max_frames=3):
         self.frames = deque(maxlen=max_frames)
         self.lock = threading.Lock()
         self.latest_timestamp = 0
+        self.latest_frame = None
 
-    def add_frame(self, timestamp: int, data: bytes):
+    def add_frame(self, timestamp: int, data: bytes, width: int, height: int):
         with self.lock:
             if timestamp > self.latest_timestamp:
-                self.frames.append({
+                frame_info = {
                     'timestamp': timestamp,
                     'data': data,
-                    'size': len(data)
-                })
+                    'size': len(data),
+                    'width': width,
+                    'height': height
+                }
+                self.frames.append(frame_info)
                 self.latest_timestamp = timestamp
+                self.latest_frame = frame_info
+                return True
+            return False
 
     def get_latest(self):
         with self.lock:
-            if self.frames:
-                return self.frames[-1]
-            return None
+            return self.latest_frame
 
     def get_stats(self):
         with self.lock:
@@ -61,7 +70,6 @@ class FrameCache:
             }
 
 frame_cache = FrameCache()
-websocket_clients: Set = set()
 
 # Shared memory reader
 class SharedMemoryReader:
@@ -69,15 +77,39 @@ class SharedMemoryReader:
         self.shm_fd = None
         self.shm_map = None
         self.running = False
+        self.last_timestamp = 0
 
     def connect(self):
         """Connect to shared memory created by Qt application"""
         try:
             # Open existing shared memory
-            self.shm_fd = os.open(f"/dev/shm{SHM_NAME}", os.O_RDONLY)
-            self.shm_map = mmap.mmap(self.shm_fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ)
-            print(f"Connected to shared memory: {SHM_NAME}")
-            return True
+            shm_path = f"/dev/shm{SHM_NAME}"
+
+            # Check if file exists and get its size
+            if os.path.exists(shm_path):
+                stat_info = os.stat(shm_path)
+                actual_size = stat_info.st_size
+
+                if actual_size == 0:
+                    print(f"Shared memory exists but is empty (0 bytes)")
+                    return False
+                elif actual_size < SHM_SIZE:
+                    print(f"Shared memory exists but is smaller than expected: {actual_size} < {SHM_SIZE}")
+                    # Try to map with the actual size instead
+                    self.shm_fd = os.open(shm_path, os.O_RDONLY)
+                    self.shm_map = mmap.mmap(self.shm_fd, actual_size, mmap.MAP_SHARED, mmap.PROT_READ)
+                    print(f"Connected to shared memory with reduced size: {actual_size} bytes")
+                    return True
+                else:
+                    # Normal case - full size available
+                    self.shm_fd = os.open(shm_path, os.O_RDONLY)
+                    self.shm_map = mmap.mmap(self.shm_fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ)
+                    print(f"Connected to shared memory: {SHM_NAME} ({SHM_SIZE} bytes)")
+                    return True
+            else:
+                print(f"Shared memory not found at {shm_path}")
+                return False
+
         except Exception as e:
             print(f"Failed to connect to shared memory: {e}")
             return False
@@ -97,12 +129,14 @@ class SharedMemoryReader:
             format_type = struct.unpack('I', self.shm_map.read(4))[0]
             ready = struct.unpack('?', self.shm_map.read(1))[0]
 
-            if not ready or size == 0:
+            if not ready or size == 0 or timestamp <= self.last_timestamp:
                 return None
 
             # Skip padding to get to data (aligned at offset 64)
             self.shm_map.seek(64)
             frame_data = self.shm_map.read(size)
+
+            self.last_timestamp = timestamp
 
             return {
                 'timestamp': timestamp,
@@ -121,8 +155,8 @@ class SharedMemoryReader:
         self.running = True
 
         def monitor_loop():
-            last_timestamp = 0
             retry_count = 0
+            frame_count = 0
 
             while self.running:
                 # Try to connect if not connected
@@ -131,25 +165,48 @@ class SharedMemoryReader:
                         retry_count = 0
                     else:
                         retry_count += 1
-                        if retry_count < 10:
-                            time.sleep(2)
-                        else:
-                            time.sleep(10)  # Back off after many failures
+                        time.sleep(2 if retry_count < 10 else 10)
                         continue
 
                 # Read frame
                 frame = self.read_frame()
-                if frame and frame['timestamp'] > last_timestamp:
-                    last_timestamp = frame['timestamp']
-                    frame_cache.add_frame(frame['timestamp'], frame['data'])
+                if frame:
+                    frame_count += 1
+                    # Add to cache
+                    if frame_cache.add_frame(frame['timestamp'], frame['data'],
+                                            frame['width'], frame['height']):
 
-                    # Notify WebSocket clients
-                    asyncio.run(broadcast_frame(frame))
+                        # Broadcast to all WebSocket clients
+                        with clients_lock:
+                            if websocket_clients:
+                                # Create frame message
+                                frame_msg = json.dumps({
+                                    'type': 'frame',
+                                    'timestamp': frame['timestamp'],
+                                    'width': frame['width'],
+                                    'height': frame['height'],
+                                    'format': frame['format'],
+                                    'data': base64.b64encode(frame['data']).decode('utf-8')
+                                })
 
-                time.sleep(0.1)  # Check 10 times per second
+                                # Add to queue for all clients
+                                try:
+                                    frame_queue.put_nowait(frame_msg)
+                                except queue.Full:
+                                    # Remove oldest frame if queue is full
+                                    try:
+                                        frame_queue.get_nowait()
+                                        frame_queue.put_nowait(frame_msg)
+                                    except:
+                                        pass
+
+                        print(f"Frame {frame_count}: {frame['size']} bytes @ {frame['timestamp']}", end='\r')
+
+                time.sleep(0.05)  # Check 20 times per second for low latency
 
         thread = threading.Thread(target=monitor_loop, daemon=True)
         thread.start()
+        print("Frame monitoring started")
 
     def close(self):
         """Clean up shared memory connection"""
@@ -161,38 +218,12 @@ class SharedMemoryReader:
 
 shm_reader = SharedMemoryReader()
 
-async def broadcast_frame(frame):
-    """Broadcast frame to all WebSocket clients"""
-    if not websocket_clients:
-        return
-
-    # Prepare frame message
-    message = json.dumps({
-        'type': 'frame',
-        'timestamp': frame['timestamp'],
-        'width': frame['width'],
-        'height': frame['height'],
-        'format': frame['format'],
-        'data': base64.b64encode(frame['data']).decode('utf-8')
-    })
-
-    # Send to all clients
-    disconnected = set()
-    for ws in websocket_clients:
-        try:
-            await ws.send(message)
-        except:
-            disconnected.add(ws)
-
-    # Remove disconnected clients
-    websocket_clients.difference_update(disconnected)
-
-# Enhanced HTML with WebSocket support
+# Enhanced HTML with improved WebSocket handling
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-  <title>OpenPilot UI Stream (Memory-Only)</title>
+  <title>OpenPilot UI Stream - Real-Time</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     body {
@@ -216,6 +247,7 @@ HTML_PAGE = """
       touch-action: none;
       user-select: none;
       image-rendering: optimizeSpeed;
+      display: block;
     }
     .status {
       position: absolute;
@@ -230,6 +262,7 @@ HTML_PAGE = """
       align-items: center;
       gap: 8px;
       backdrop-filter: blur(10px);
+      z-index: 100;
     }
     .status-indicator {
       width: 8px;
@@ -240,10 +273,15 @@ HTML_PAGE = """
     }
     .status-indicator.connected {
       background: #44ff44;
+      animation: none;
+    }
+    .status-indicator.streaming {
+      background: #44ff44;
+      animation: pulse 1s infinite;
     }
     @keyframes pulse {
       0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
+      50% { opacity: 0.3; }
     }
     .stats {
       position: absolute;
@@ -256,6 +294,7 @@ HTML_PAGE = """
       font-size: 11px;
       font-family: monospace;
       backdrop-filter: blur(10px);
+      z-index: 100;
     }
     .touch-indicator {
       position: absolute;
@@ -267,94 +306,171 @@ HTML_PAGE = """
       pointer-events: none;
       transform: translate(-50%, -50%);
       animation: fadeOut 0.5s ease-out forwards;
+      z-index: 200;
     }
     @keyframes fadeOut {
       0% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
       100% { opacity: 0; transform: translate(-50%, -50%) scale(1.5); }
     }
-    .no-connection {
+    .loading {
       color: #fff;
       text-align: center;
       padding: 20px;
+      font-size: 18px;
+    }
+    #debug {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      color: #0f0;
+      background: rgba(0,0,0,0.8);
+      padding: 5px;
+      font-family: monospace;
+      font-size: 10px;
+      max-width: 300px;
+      z-index: 100;
     }
   </style>
 </head>
 <body>
   <div id="ui-container">
-    <canvas id="ui"></canvas>
+    <canvas id="ui" width="2160" height="1080"></canvas>
     <div class="status">
       <div class="status-indicator" id="status-indicator"></div>
       <span id="status-text">Connecting...</span>
     </div>
     <div class="stats" id="stats">
-      FPS: 0 | Latency: 0ms | Memory: 0KB
+      FPS: 0 | Frames: 0 | Latency: 0ms
     </div>
+    <div id="debug"></div>
   </div>
 
   <script>
     const canvas = document.getElementById('ui');
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: false });
     const container = document.getElementById('ui-container');
     const statusIndicator = document.getElementById('status-indicator');
     const statusText = document.getElementById('status-text');
     const stats = document.getElementById('stats');
+    const debug = document.getElementById('debug');
 
     let ws = null;
     let reconnectTimer = null;
     let frameCount = 0;
-    let lastFrameTime = 0;
+    let totalFrames = 0;
     let fps = 0;
+    let lastFpsTime = Date.now();
     let latency = 0;
-    let memoryUsage = 0;
+    let isConnected = false;
+    let lastFrameTime = 0;
+
+    // Optimized image rendering
+    const imagePool = [];
+    let currentImageIndex = 0;
+
+    // Pre-create image objects for better performance
+    for (let i = 0; i < 3; i++) {
+      imagePool.push(new Image());
+    }
 
     // FPS calculation
-    setInterval(() => {
-      fps = frameCount;
-      frameCount = 0;
-      stats.textContent = `FPS: ${fps} | Latency: ${latency}ms | Memory: ${memoryUsage}KB`;
-    }, 1000);
+    function updateStats() {
+      const now = Date.now();
+      const elapsed = now - lastFpsTime;
+      if (elapsed >= 1000) {
+        fps = Math.round((frameCount * 1000) / elapsed);
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+      stats.textContent = `FPS: ${fps} | Frames: ${totalFrames} | Latency: ${latency}ms`;
+    }
+
+    function renderFrame(frameData) {
+      const img = imagePool[currentImageIndex];
+      currentImageIndex = (currentImageIndex + 1) % imagePool.length;
+
+      img.onload = function() {
+        // Update canvas size if needed
+        if (canvas.width !== img.width || canvas.height !== img.height) {
+          canvas.width = img.width;
+          canvas.height = img.height;
+        }
+
+        // Draw frame
+        ctx.drawImage(img, 0, 0);
+
+        frameCount++;
+        totalFrames++;
+        lastFrameTime = Date.now();
+        updateStats();
+      };
+
+      img.onerror = function() {
+        console.error('Failed to load frame');
+      };
+
+      // Set image source
+      img.src = 'data:image/jpeg;base64,' + frameData;
+    }
 
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${protocol}//${window.location.host}/stream`);
+      const wsUrl = `${protocol}//${window.location.host}/stream`;
+
+      console.log('Connecting to WebSocket:', wsUrl);
+      debug.textContent = `Connecting to ${wsUrl}...`;
+
+      ws = new WebSocket(wsUrl);
+
+      ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
         console.log('WebSocket connected');
-        statusIndicator.classList.add('connected');
-        statusText.textContent = 'Connected';
+        isConnected = true;
+        statusIndicator.className = 'status-indicator connected';
+        statusText.textContent = 'Connected - Waiting for frames';
+        debug.textContent = 'Connected successfully';
+
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
           reconnectTimer = null;
         }
+
+        // Request initial frame
+        ws.send(JSON.stringify({ type: 'request_frame' }));
       };
 
       ws.onmessage = (event) => {
-        const message = JSON.parse(event.data);
+        try {
+          const message = JSON.parse(event.data);
 
-        if (message.type === 'frame') {
-          const receiveTime = Date.now();
-          latency = Math.round(receiveTime - message.timestamp);
+          if (message.type === 'frame') {
+            const receiveTime = Date.now();
+            latency = Math.max(0, receiveTime - message.timestamp);
 
-          // Decode and display frame
-          const img = new Image();
-          img.onload = () => {
-            canvas.width = img.width;
-            canvas.height = img.height;
-            ctx.drawImage(img, 0, 0);
-            frameCount++;
-          };
-          img.src = 'data:image/jpeg;base64,' + message.data;
+            // Update status to show streaming
+            statusIndicator.className = 'status-indicator streaming';
+            statusText.textContent = 'Streaming';
 
-          memoryUsage = Math.round(message.data.length * 0.75 / 1024); // Approximate decoded size
-        } else if (message.type === 'stats') {
-          memoryUsage = message.memory_kb;
+            // Render frame
+            renderFrame(message.data);
+
+            debug.textContent = `Frame received: ${message.width}x${message.height}, ${latency}ms latency`;
+          } else if (message.type === 'stats') {
+            debug.textContent = `Server stats: ${message.frames_cached} frames, ${message.memory_kb}KB`;
+          }
+        } catch (e) {
+          console.error('Error processing message:', e);
+          debug.textContent = `Error: ${e.message}`;
         }
       };
 
-      ws.onclose = () => {
-        console.log('WebSocket disconnected');
-        statusIndicator.classList.remove('connected');
-        statusText.textContent = 'Disconnected';
+      ws.onclose = (event) => {
+        console.log('WebSocket disconnected:', event.code, event.reason);
+        isConnected = false;
+        statusIndicator.className = 'status-indicator';
+        statusText.textContent = 'Disconnected - Reconnecting...';
+        debug.textContent = `Disconnected: ${event.reason || 'Connection lost'}`;
 
         // Reconnect after 2 seconds
         if (!reconnectTimer) {
@@ -364,8 +480,20 @@ HTML_PAGE = """
 
       ws.onerror = (error) => {
         console.error('WebSocket error:', error);
+        debug.textContent = `WebSocket error occurred`;
       };
     }
+
+    // Check for stale frames
+    setInterval(() => {
+      if (isConnected && Date.now() - lastFrameTime > 5000) {
+        debug.textContent = 'No frames received for 5 seconds';
+        // Request a frame
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'request_frame' }));
+        }
+      }
+    }, 5000);
 
     // Touch/click handling
     function getDeviceCoordinates(clientX, clientY) {
@@ -389,8 +517,9 @@ HTML_PAGE = """
     function showTouchIndicator(x, y) {
       const indicator = document.createElement('div');
       indicator.className = 'touch-indicator';
-      indicator.style.left = x + 'px';
-      indicator.style.top = y + 'px';
+      const rect = canvas.getBoundingClientRect();
+      indicator.style.left = (x + rect.left) + 'px';
+      indicator.style.top = (y + rect.top) + 'px';
       container.appendChild(indicator);
       setTimeout(() => container.removeChild(indicator), 500);
     }
@@ -398,8 +527,8 @@ HTML_PAGE = """
     // Mouse events
     canvas.addEventListener('click', (e) => {
       const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      const rect = canvas.getBoundingClientRect();
-      showTouchIndicator(e.clientX - rect.left, e.clientY - rect.top);
+      showTouchIndicator(e.clientX - canvas.getBoundingClientRect().left,
+                        e.clientY - canvas.getBoundingClientRect().top);
       sendInput({ type: 'click', x: coords.x, y: coords.y });
     });
 
@@ -413,32 +542,11 @@ HTML_PAGE = """
       }
     });
 
-    canvas.addEventListener('touchend', (e) => {
-      e.preventDefault();
-      if (e.changedTouches.length === 1) {
-        const touch = e.changedTouches[0];
-        const coords = getDeviceCoordinates(touch.clientX, touch.clientY);
-        const rect = canvas.getBoundingClientRect();
-        showTouchIndicator(touch.clientX - rect.left, touch.clientY - rect.top);
-        sendInput({ type: 'tap', x: coords.x, y: coords.y });
-      }
-    });
-
-    // Scroll handling
-    canvas.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      const coords = getDeviceCoordinates(e.clientX, e.clientY);
-      sendInput({
-        type: 'scroll',
-        x: coords.x,
-        y: coords.y,
-        deltaY: e.deltaY,
-        direction: e.deltaY > 0 ? 'down' : 'up'
-      });
-    });
-
     // Start WebSocket connection
     connectWebSocket();
+
+    // Update stats periodically
+    setInterval(updateStats, 100);
   </script>
 </body>
 </html>
@@ -453,7 +561,6 @@ def handle_input():
     """Handle input events from web client"""
     data = request.get_json()
     event_type = data.get('type', 'click')
-
     print(f"Received {event_type} event: {data}")
 
     # Send to Qt application via Unix socket
@@ -472,46 +579,116 @@ def handle_input():
 
 @sock.route('/stream')
 def stream(ws):
-    """WebSocket endpoint for frame streaming"""
-    websocket_clients.add(ws)
-    print(f"Client connected. Total clients: {len(websocket_clients)}")
+    """WebSocket endpoint for real-time frame streaming"""
+    client_id = id(ws)
+    print(f"Client {client_id} connected")
+
+    with clients_lock:
+        websocket_clients.add(ws)
+        client_count = len(websocket_clients)
+
+    print(f"Total clients: {client_count}")
 
     try:
         # Send current frame immediately if available
         latest = frame_cache.get_latest()
         if latest:
-            ws.send(json.dumps({
+            initial_msg = json.dumps({
                 'type': 'frame',
                 'timestamp': latest['timestamp'],
-                'data': base64.b64encode(latest['data']).decode('utf-8'),
-                'width': 2160,  # Default dimensions
-                'height': 1080,
-                'format': 'jpeg'
-            }))
+                'width': latest['width'],
+                'height': latest['height'],
+                'format': 'jpeg',
+                'data': base64.b64encode(latest['data']).decode('utf-8')
+            })
+            ws.send(initial_msg)
+            print(f"Sent initial frame to client {client_id}")
 
-        # Keep connection alive and send stats periodically
+        # Main streaming loop
         while True:
-            time.sleep(5)
-            stats = frame_cache.get_stats()
-            ws.send(json.dumps({
-                'type': 'stats',
-                'memory_kb': stats['total_memory_kb'],
-                'frames_cached': stats['frames_cached']
-            }))
-    except:
-        pass
+            try:
+                # Wait for new frames with timeout
+                frame_msg = frame_queue.get(timeout=5)
+
+                # Send frame to this client
+                ws.send(frame_msg)
+
+                # Clear the queue item
+                frame_queue.task_done()
+
+            except queue.Empty:
+                # Send keepalive/stats
+                stats = frame_cache.get_stats()
+                ws.send(json.dumps({
+                    'type': 'stats',
+                    'frames_cached': stats['frames_cached'],
+                    'memory_kb': stats['total_memory_kb']
+                }))
+            except Exception as e:
+                print(f"Error sending to client {client_id}: {e}")
+                break
+
+            # Check for client messages (like frame requests)
+            data = ws.receive(timeout=0)
+            if data:
+                try:
+                    msg = json.loads(data)
+                    if msg.get('type') == 'request_frame':
+                        latest = frame_cache.get_latest()
+                        if latest:
+                            ws.send(json.dumps({
+                                'type': 'frame',
+                                'timestamp': latest['timestamp'],
+                                'width': latest['width'],
+                                'height': latest['height'],
+                                'format': 'jpeg',
+                                'data': base64.b64encode(latest['data']).decode('utf-8')
+                            }))
+                except:
+                    pass
+
+    except Exception as e:
+        print(f"Client {client_id} error: {e}")
     finally:
-        websocket_clients.discard(ws)
-        print(f"Client disconnected. Total clients: {len(websocket_clients)}")
+        with clients_lock:
+            websocket_clients.discard(ws)
+            client_count = len(websocket_clients)
+        print(f"Client {client_id} disconnected. Total clients: {client_count}")
 
 @app.route('/stats')
 def get_stats():
     """Get memory and performance statistics"""
     stats = frame_cache.get_stats()
-    stats['websocket_clients'] = len(websocket_clients)
+    with clients_lock:
+        stats['websocket_clients'] = len(websocket_clients)
     return jsonify(stats)
 
-def wait_for_wifi(interface="wlan0", timeout=30, delay=2):
+# Alternative SSE endpoint for browsers that have WebSocket issues
+@app.route('/stream-sse')
+def stream_sse():
+    """Server-Sent Events endpoint as fallback"""
+    def generate():
+        last_timestamp = 0
+        while True:
+            latest = frame_cache.get_latest()
+            if latest and latest['timestamp'] > last_timestamp:
+                last_timestamp = latest['timestamp']
+                data = {
+                    'type': 'frame',
+                    'timestamp': latest['timestamp'],
+                    'width': latest['width'],
+                    'height': latest['height'],
+                    'data': base64.b64encode(latest['data']).decode('utf-8')
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+            else:
+                # Send heartbeat
+                yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+            time.sleep(0.1)
+
+    return Response(generate(), mimetype="text/event-stream")
+
+def wait_for_wifi(interface="wlan0", timeout=10, delay=2):
     """Wait for network connection"""
     print("Waiting for network connection...")
     for _ in range(timeout // delay):
@@ -530,8 +707,13 @@ def wait_for_wifi(interface="wlan0", timeout=30, delay=2):
 if __name__ == '__main__':
     wait_for_wifi()
 
-    print("Starting memory-only streaming server...")
-    print("No disk storage required - using shared memory")
+    print("="*60)
+    print("🚀 OpenPilot UI Real-Time Streaming Server")
+    print("="*60)
+    print("✅ Zero disk storage - Memory only")
+    print("✅ WebSocket real-time streaming")
+    print("✅ Automatic frame broadcasting")
+    print("="*60)
 
     # Start shared memory monitoring
     shm_reader.start_monitoring()
