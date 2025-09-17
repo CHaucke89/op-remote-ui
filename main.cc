@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QTranslator>
+#include <QTimer>
 
 #include "system/hardware/hw.h"
 #include "selfdrive/ui/qt/qt_window.h"
@@ -29,12 +30,17 @@ int main(int argc, char *argv[]) {
   setMainWindow(&w);
   a.installEventFilter(&w);
 
-  // Set up memory-based frame streamer (no disk storage)
-  FrameStreamer frameStreamer(&w);
-  frameStreamer.start();
-
   // Set up touch injector
   TouchInjector touchInjector(&w);
+
+  // Set up memory-based frame streamer AFTER window is set up
+  // Pass the window directly like the working screenshot code did
+  QTimer::singleShot(1000, [&w]() {
+    // Create frame streamer after window is fully initialized
+    static FrameStreamer frameStreamer(&w);
+    frameStreamer.start();
+    qDebug() << "Frame streaming started after window initialization";
+  });
 
   qDebug() << "UI started with memory-only streaming (no disk storage)";
 

@@ -205,7 +205,13 @@ class SharedMemoryReader:
                                     except:
                                         pass
 
-                        print(f"Frame {frame_count}: {frame['size']} bytes @ {frame['timestamp']}", end='\r')
+                        # Debug: Check if frame data is valid JPEG
+                        if frame_count % 10 == 0:
+                            # Check JPEG header
+                            if frame['data'][:2] == b'\xff\xd8':
+                                print(f"Frame {frame_count}: Valid JPEG, {frame['size']} bytes, {frame['width']}x{frame['height']}")
+                            else:
+                                print(f"Frame {frame_count}: INVALID DATA! First bytes: {frame['data'][:10].hex() if frame['data'] else 'empty'}")
 
                 time.sleep(0.05)  # Check 20 times per second for low latency
 

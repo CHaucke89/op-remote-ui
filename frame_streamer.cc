@@ -72,8 +72,8 @@ void FrameStreamer::cleanupSharedMemory() {
 
 void FrameStreamer::start() {
   if (!timer_ || !shared_frame_) return;
-  timer_->start(500);  // 2 FPS for lower resource usage
-  qDebug() << "Frame streaming started";
+  timer_->start(100);  // 10 FPS for better responsiveness
+  qDebug() << "Frame streaming started at 10 FPS";
 }
 
 void FrameStreamer::stop() {
@@ -88,11 +88,27 @@ void FrameStreamer::captureFrame() {
 
   QMutexLocker locker(&mutex_);
 
-  // Capture the window
-  QPixmap pixmap = window_->grab();
+  // Capture the window - using exact same method as working screenshot code
+  QPixmap pixmap = window_->grab();  // This should capture the MainWindow content
   if (pixmap.isNull()) {
-    qWarning() << "Failed to capture frame";
+    qWarning() << "Failed to capture frame - pixmap is null";
     return;
+  }
+
+  // Debug: Check if pixmap has actual content
+  if (pixmap.width() == 0 || pixmap.height() == 0) {
+    qWarning() << "Captured pixmap has zero dimensions";
+    return;
+  }
+
+  // Extra debug: Save first frame to file to verify content
+  static bool first_frame_saved = false;
+  if (!first_frame_saved) {
+    QString debug_file = "/tmp/debug_frame.png";
+    if (pixmap.save(debug_file)) {
+      qDebug() << "Debug: First frame saved to" << debug_file << "- check if it has UI content";
+    }
+    first_frame_saved = true;
   }
 
   // Convert to JPEG for compression
@@ -128,6 +144,12 @@ void FrameStreamer::captureFrame() {
   // Mark as ready
   shared_frame_->ready.store(true);
 
-  qDebug() << "Frame captured:" << jpeg_data.size() << "bytes, "
-           << pixmap.width() << "x" << pixmap.height();
+  static int frame_count = 0;
+  frame_count++;
+  if (frame_count % 10 == 0) {  // Log every 10th frame
+    qDebug() << "Frame" << frame_count << "captured:" << jpeg_data.size() << "bytes, "
+             << pixmap.width() << "x" << pixmap.height()
+             << "Window:" << window_->geometry()
+             << "Visible:" << window_->isVisible();
+  }
 }
