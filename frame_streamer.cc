@@ -129,20 +129,23 @@ void FrameStreamer::captureFrame() {
   }
 
   // Mark as not ready while updating
-  shared_frame_->ready.store(false);
+  shared_frame_->ready = 0;
 
   // Update metadata
-  shared_frame_->timestamp.store(QDateTime::currentMSecsSinceEpoch());
-  shared_frame_->width.store(pixmap.width());
-  shared_frame_->height.store(pixmap.height());
-  shared_frame_->size.store(jpeg_data.size());
-  shared_frame_->format.store(1);  // 1 = JPEG
+  shared_frame_->timestamp = QDateTime::currentMSecsSinceEpoch();
+  shared_frame_->width = pixmap.width();
+  shared_frame_->height = pixmap.height();
+  shared_frame_->size = jpeg_data.size();
+  shared_frame_->format = 1;  // 1 = JPEG
 
   // Copy data
   memcpy(shared_frame_->data, jpeg_data.data(), jpeg_data.size());
 
+  // Memory barrier to ensure all writes are visible
+  __sync_synchronize();
+
   // Mark as ready
-  shared_frame_->ready.store(true);
+  shared_frame_->ready = 1;
 
   static int frame_count = 0;
   frame_count++;

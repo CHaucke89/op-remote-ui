@@ -21,15 +21,19 @@ public:
   void start();
   void stop();
 
+  // Pack the struct to ensure consistent layout between C++ and Python
+  #pragma pack(push, 1)
   struct SharedFrame {
-    std::atomic<uint64_t> timestamp{0};
-    std::atomic<uint32_t> width{0};
-    std::atomic<uint32_t> height{0};
-    std::atomic<uint32_t> size{0};
-    std::atomic<uint32_t> format{0};
-    std::atomic<bool> ready{false};
+    uint64_t timestamp;
+    uint32_t width;
+    uint32_t height;
+    uint32_t size;
+    uint32_t format;
+    uint8_t ready;
+    uint8_t padding[6];  // Align data to 32-byte boundary
     uint8_t data[4 * 1920 * 1080];  // Max 4K frame buffer
   };
+  #pragma pack(pop)
 
 private slots:
   void captureFrame();
