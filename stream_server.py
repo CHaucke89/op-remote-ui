@@ -25,7 +25,10 @@ sock = Sock(app)
 
 # Shared memory configuration
 SHM_NAME = "/openpilot_ui_frames"
-SHM_SIZE = 4 * 1920 * 1080 + 1024  # Frame buffer + metadata
+# Match C++ SharedFrame struct size:
+# metadata (8+4+4+4+4+1 = 25 bytes, padded to 32 for alignment) + data buffer
+FRAME_DATA_SIZE = 4 * 1920 * 1080  # 8,294,400 bytes
+SHM_SIZE = 32 + FRAME_DATA_SIZE  # Total: 8,294,432 bytes
 
 # Global queue for frame distribution
 frame_queue = queue.Queue(maxsize=10)
@@ -120,20 +123,22 @@ class SharedMemoryReader:
             return None
 
         try:
-            # Read metadata (first 32 bytes)
+            # Read metadata - matching C++ SharedFrame struct layout
             self.shm_map.seek(0)
-            timestamp = struct.unpack('Q', self.shm_map.read(8))[0]
-            width = struct.unpack('I', self.shm_map.read(4))[0]
-            height = struct.unpack('I', self.shm_map.read(4))[0]
-            size = struct.unpack('I', self.shm_map.read(4))[0]
-            format_type = struct.unpack('I', self.shm_map.read(4))[0]
-            ready = struct.unpack('?', self.shm_map.read(1))[0]
+            timestamp = struct.unpack('Q', self.shm_map.read(8))[0]  # uint64_t
+            width = struct.unpack('I', self.shm_map.read(4))[0]      # uint32_t
+            height = struct.unpack('I', self.shm_map.read(4))[0]     # uint32_t
+            size = struct.unpack('I', self.shm_map.read(4))[0]       # uint32_t
+            format_type = struct.unpack('I', self.shm_map.read(4))[0] # uint32_t
+            ready = struct.unpack('?', self.shm_map.read(1))[0]      # bool
 
             if not ready or size == 0 or timestamp <= self.last_timestamp:
                 return None
 
-            # Skip padding to get to data (aligned at offset 64)
-            self.shm_map.seek(64)
+            # The data array starts immediately after the metadata
+            # Due to struct alignment, there might be padding after 'ready'
+            # Total metadata is 25 bytes, likely padded to 32 bytes before data array
+            self.shm_map.seek(32)
             frame_data = self.shm_map.read(size)
 
             self.last_timestamp = timestamp
