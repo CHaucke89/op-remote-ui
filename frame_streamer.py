@@ -85,14 +85,14 @@ class FrameStreamer:
         try:
             width = rl_image.width
             height = rl_image.height
-            if not width or not height or int(ctypes.cast(rl_image.data, ctypes.c_void_p).value or 0) == 0:
+            # rl_image.data is a cffi pointer; int() yields its raw address.
+            addr = int(rl_image.data)
+            if not width or not height or addr == 0:
                 return
 
             # Wrap the raw RGBA framebuffer without copying.
             data_size = width * height * 4
-            buf = (ctypes.c_ubyte * data_size).from_address(
-                int(ctypes.cast(rl_image.data, ctypes.c_void_p).value)
-            )
+            buf = (ctypes.c_ubyte * data_size).from_address(addr)
 
             # load_image_from_screen already returns top-to-bottom orientation.
             pil_img = Image.frombuffer("RGBA", (width, height), buf, "raw", "RGBA", 0, 1)
