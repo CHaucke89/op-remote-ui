@@ -8,23 +8,30 @@ See: https://www.youtube.com/watch?v=7bqbqOVJRFc
 
 This implementation uses a sophisticated memory-based streaming architecture:
 
-1. **Frame Capture** (C++): Qt application captures frames at 10 FPS and writes compressed JPEG data to shared memory
+1. **Frame Capture** (Python): The raylib/pyray UI captures the framebuffer at 10 FPS and writes compressed JPEG data to shared memory
 2. **Stream Server** (Python): Reads shared memory continuously and broadcasts frames to connected WebSocket clients
 3. **Web Interface** (HTML/JS): Displays frames on HTML5 Canvas with real-time status and FPS monitoring
-4. **Input Injection** (C++): Receives touch/click/scroll events from the browser via Unix socket and injects them into the Qt application
+4. **Input Injection** (Python): Receives touch/click/scroll events from the browser via Unix socket and injects them into the raylib UI by hooking pyray's polled input functions
+
+> **Note:** The original implementation targeted the old Qt-based openpilot UI
+> (`frame_streamer.cc`, `touch_injector.cc`, `main.cc` — kept for reference).
+> The new openpilot UI is written in raylib/pyray, so capture and injection are
+> now pure Python (`frame_streamer.py`, `touch_injector.py`, `remote_ui.py`).
+> The shared-memory format and touch socket protocol are unchanged, so
+> `stream_server.py` and the web interface work with either backend.
 
 ### Technical Architecture
 
 ```
-Qt Application (MainWindow)
-    ↓ [10 FPS capture]
-FrameStreamer (C++)
+openpilot UI (raylib/pyray render loop)
+    ↓ [10 FPS capture via load_image_from_screen()]
+FrameStreamer (Python)
     ↓ [Shared Memory: /dev/shm/openpilot_ui_frames]
 StreamServer (Python)
     ↓ [WebSocket on port 8081]
 Web Browser (HTML5 Canvas)
-    ↓ [Input events via WebSocket]
-TouchInjector (C++) → Qt Application
+    ↓ [Input events via WebSocket → /input → Unix socket]
+TouchInjector (Python, pyray input hooks) → openpilot UI
 ```
 
 ### Key Features
@@ -133,36 +140,48 @@ git checkout -b ui_streaming
 
 Copy the following files to your openpilot directory:
 
-**C++ Components**:
-- `frame_streamer.h` → `/data/openpilot/selfdrive/ui/`
-- `frame_streamer.cc` → `/data/openpilot/selfdrive/ui/`
-- `touch_injector.h` → `/data/openpilot/selfdrive/ui/`
-- `touch_injector.cc` → `/data/openpilot/selfdrive/ui/`
-- Replace existing `main.cc` → `/data/openpilot/selfdrive/ui/`
+**UI-side Python modules** → `/data/openpilot/selfdrive/ui/`:
+- `frame_streamer.py`
+- `touch_injector.py`
+- `remote_ui.py`
 
-**Python Server**:
+**Python Server** (on the device or any host that can reach it):
 - `stream_server.py` → `/data/`
 
-### 4. Update SConscript
+No compilation is required — the new UI is Python, so there are no `.cc`
+files to build and no `SConscript`/`scons` step. (The legacy C++ files remain
+in this repo for reference only.)
 
-Modify `/data/openpilot/selfdrive/ui/SConscript` to include the new source files:
+### 4. Wire into the UI render loop
+
+Edit `/data/openpilot/selfdrive/ui/ui.py` (the raylib entry point) to create a
+`RemoteUI` after the window is initialised and stream each frame inside the
+render loop:
 
 ```python
-qt_src = [
-  # ... existing files ...
-  'touch_injector.cc',
-  'frame_streamer.cc',
-  # ... other files ...
-]
+from openpilot.selfdrive.ui.remote_ui import RemoteUI
+
+def main():
+    gui_app.init_window("UI")
+    remote = RemoteUI()              # starts touch socket + pyray input hooks
+    try:
+        for _ in gui_app.render():
+            # ... existing per-frame draw code ...
+            remote.stream_frame()    # capture the frame just drawn
+    finally:
+        remote.close()
 ```
 
-### 5. Rebuild the UI
+`stream_frame()` must be called while the frame is still on screen (before
+raylib swaps buffers), so place it near the end of the loop body.
 
-Compile the modified UI:
+### 5. Install UI-side dependencies
+
+The capture path needs Pillow (Qt previously provided JPEG encoding); pyray is
+already shipped with openpilot:
 
 ```bash
-cd /data/openpilot
-scons selfdrive/ui
+pip3 install Pillow
 ```
 
 ### 6. Auto-Start on Boot (Optional)
