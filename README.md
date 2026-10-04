@@ -98,7 +98,11 @@ pip3 install -r requirements.txt
 
 ## Integrating into openpilot UI (raylib/pyray)
 
-Edit your UI entrypoint (typically `selfdrive/ui/ui.py`) and wire `RemoteUI` into the render loop:
+Copy `remote_ui.py`, `touch_injector.py`, and `frame_streamer.py` to `/openpilot/selfdrive/ui/`.
+Copy `stream_server.py` to `/data/`.
+
+Edit your UI entrypoint (typically `selfdrive/ui/ui.py`) and wire `RemoteUI` into the render loop.
+Imort `RemoteUI` and create a `remote` object:
 
 ```python
 from openpilot.selfdrive.ui.remote_ui import RemoteUI
@@ -106,12 +110,22 @@ from openpilot.selfdrive.ui.remote_ui import RemoteUI
 def main():
         gui_app.init_window("UI")
         remote = RemoteUI()
-        try:
-                for _ in gui_app.render():
-                        # existing draw logic...
-                        remote.stream_frame()
-        finally:
-                remote.close()
+```
+
+Stream the frame after `should_render`:
+
+```python
+if should_render:
+    remote.stream_frame()
+```
+
+Close the connection - add to the very end of `main()`:
+
+```python
+    remote.close()
+
+if __name__ == "__main__":
+  main()
 ```
 
 Important:
@@ -125,6 +139,14 @@ Start server:
 
 ```bash
 python3 stream_server.py
+```
+
+Optionally, have the server start automatically on boot. Add to `launch_openpilot.sh` after the shebang:
+
+```bash
+#!/usr/bin/env bash
+
+python3 /data/stream_server.py &
 ```
 
 Open in browser:
